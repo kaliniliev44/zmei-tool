@@ -1,4 +1,4 @@
-from modules import port_scanner
+from modules import port_scanner, network_sniffer
 
 def main():
     print("Zmei - Python SOC Toolkit")
@@ -86,8 +86,7 @@ def main():
                     )
             
             elif choice == '6':  # Network Sniffer
-                print("Network Sniffer module is not implemented yet.")
-                
+                network_sniffer.start_network_sniffer()
             
         elif choice == '0':
             print("\nHelp:")

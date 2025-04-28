@@ -5,8 +5,9 @@ def main():
     print("Version 1.0")
     print("Tools:")
     print("0. Help")
-    print("1. Port Scanner")
-    print("2. Network Sniffer")
+    print("1. Port Scanner (single port)")
+    print("2. Port Scanner (multi port)")
+    print("3. Network Sniffer")
 
     # update the tools list as needed
     tools = {
@@ -27,12 +28,12 @@ def main():
                     # Call the port scanner function for a single port
                     target_ip = input("Enter target IP address: ")
                     port = int(input("Enter port number to scan: "))
-                    port_scanner.scan_port(target_ip, port)
                 case '2':
                     # Call the port scanner function for a range of ports
                     target_ip = input("Enter target IP address: ")
                     start_port = int(input("Enter starting port number: "))
                     end_port = int(input("Enter ending port number: "))
+                    port_scanner.scan_port_range(target_ip, start_port, end_port)
                     # Implement the multi-port scanning logic here
             
         elif choice == '0':

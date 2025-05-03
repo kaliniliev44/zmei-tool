@@ -1,13 +1,14 @@
-import scapy.all as scapy
-from scapy.layers import http
+import pyshark
 import time
 import threading
 import socket
 import collections
 from datetime import datetime
+import sys
+import os
+import subprocess
 
-# Store captured packets
-captured_packets = []
+# Store capture statistics
 packet_counts = {
     'total': 0,
     'tcp': 0, 
@@ -24,13 +25,120 @@ src_ports = collections.Counter()
 dst_ports = collections.Counter()
 protocols = collections.Counter()
 
-def get_interfaces():
-    """Get list of available network interfaces"""
+# Flag to control the capture process
+stop_capture = threading.Event()
+
+# Path to tshark executable
+TSHARK_PATH = None
+
+def find_tshark_path():
+    """Find the tshark.exe path on Windows"""
+    global TSHARK_PATH
+    
+    # First check if it's in PATH
     try:
-        return scapy.get_if_list()
+        # Try to run tshark directly
+        result = subprocess.run(
+            ["tshark", "--version"], 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode == 0:
+            # Found in PATH
+            TSHARK_PATH = "tshark"
+            return True
+    except:
+        pass
+    
+    # If not in PATH, search common installation directories
+    if os.name == 'nt':  # Windows
+        # Common installation paths
+        common_paths = [
+            r"C:\Program Files\Wireshark\tshark.exe",
+            r"C:\Program Files (x86)\Wireshark\tshark.exe",
+            r"C:\Wireshark\tshark.exe",
+            r"D:\Wireshark\tshark.exe",
+        ]
+        
+        # Search registry for Wireshark installation path
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WiresharkGroup\Wireshark") as key:
+                install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
+                common_paths.insert(0, os.path.join(install_dir, "tshark.exe"))
+        except:
+            pass
+            
+        # Check if any of the common paths exist
+        for path in common_paths:
+            if os.path.exists(path):
+                TSHARK_PATH = path
+                return True
+                
+        # If not found in common paths, try searching Program Files directories
+        for root_dir in [r"C:\Program Files", r"C:\Program Files (x86)"]:
+            if os.path.exists(root_dir):
+                for dir_name in os.listdir(root_dir):
+                    if "wireshark" in dir_name.lower():
+                        candidate = os.path.join(root_dir, dir_name, "tshark.exe")
+                        if os.path.exists(candidate):
+                            TSHARK_PATH = candidate
+                            return True
+    else:  # Unix/Linux/Mac
+        # Check common Unix paths
+        common_paths = [
+            "/usr/bin/tshark",
+            "/usr/local/bin/tshark",
+            "/opt/wireshark/bin/tshark"
+        ]
+        for path in common_paths:
+            if os.path.exists(path):
+                TSHARK_PATH = path
+                return True
+    
+    return False
+
+def get_interfaces():
+    """Get list of available network interfaces using pyshark"""
+    global TSHARK_PATH
+    try:
+        # This uses tshark to get interfaces, using the path we found
+        if TSHARK_PATH and TSHARK_PATH != "tshark":
+            # We need to set the path for pyshark to use
+            os.environ['PATH'] = os.environ.get('PATH', '') + os.pathsep + os.path.dirname(TSHARK_PATH)
+            
+        tshark_interfaces = pyshark.tshark.tshark.get_tshark_interfaces()
+        return [interface['name'] for interface in tshark_interfaces]
     except Exception as e:
-        print(f"Error getting interfaces: {e}")
-        return []
+        print(f"Error getting interfaces from tshark: {e}")
+        # Fallback to OS-specific methods
+        if os.name == 'nt':  # Windows
+            # Get network interfaces from ipconfig
+            try:
+                result = subprocess.run(
+                    ["ipconfig"], 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                if result.returncode == 0:
+                    interfaces = []
+                    for line in result.stdout.split('\n'):
+                        if "adapter" in line and ":" in line:
+                            # Extract adapter name
+                            adapter_name = line.split(':')[0].strip()
+                            interfaces.append(adapter_name)
+                    if interfaces:
+                        return interfaces
+            except:
+                pass
+            
+            # Last resort for Windows
+            return ["Ethernet", "Wi-Fi", "Local Area Connection", "Wireless Network Connection"]
+        else:
+            # Fallback for Unix-like systems
+            return ["eth0", "wlan0", "en0", "en1"]
 
 def get_local_ip():
     """Get the local IP address of the machine"""
@@ -45,84 +153,102 @@ def get_local_ip():
         s.close()
     return local_ip
 
-def packet_callback(packet):
-    """Process each captured packet"""
-    global captured_packets, packet_counts
+def print_packet_summary(packet):
+    """Print a summary of the packet"""
+    # Get current timestamp
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    summary = f"[{timestamp}] "
     
-    # Add packet to our list
-    captured_packets.append(packet)
+    # Extract packet information
+    try:
+        # Check if packet has IP layer
+        if hasattr(packet, 'ip'):
+            summary += f"{packet.ip.src} → {packet.ip.dst} "
+            
+            if hasattr(packet, 'tcp'):
+                summary += f"TCP {packet.tcp.srcport} → {packet.tcp.dstport}"
+                # Check for HTTP
+                if hasattr(packet, 'http'):
+                    try:
+                        if hasattr(packet.http, 'host') and hasattr(packet.http, 'request_uri'):
+                            url = packet.http.host + packet.http.request_uri
+                            summary += f" HTTP: {url}"
+                        else:
+                            summary += " HTTP"
+                    except:
+                        summary += " HTTP"
+                    
+            elif hasattr(packet, 'udp'):
+                summary += f"UDP {packet.udp.srcport} → {packet.udp.dstport}"
+                # Check for DNS
+                if hasattr(packet, 'dns'):
+                    try:
+                        if hasattr(packet.dns, 'qry_name'):
+                            summary += f" DNS: {packet.dns.qry_name}"
+                        else:
+                            summary += " DNS"
+                    except:
+                        summary += " DNS"
+                    
+            elif hasattr(packet, 'icmp'):
+                summary += f"ICMP type={packet.icmp.type}"
+                
+        else:
+            # Extract the highest layer as the protocol
+            highest_layer = packet.highest_layer
+            summary += f"{highest_layer} packet: {packet}"
+    except Exception as e:
+        summary += f"Error parsing packet: {e}"
+    
+    print(summary)
+    sys.stdout.flush()  # Force flush output
+
+def process_packet(packet):
+    """Process each captured packet"""
+    global packet_counts
+    
+    # Skip incomplete packets
+    if not packet:
+        return
     
     with stats_lock:
         packet_counts['total'] += 1
         
         # Identify packet type and update counters
-        if packet.haslayer(scapy.TCP):
+        if hasattr(packet, 'tcp'):
             packet_counts['tcp'] += 1
             protocols['TCP'] += 1
-            if packet.haslayer(scapy.IP):
-                src_ips[packet[scapy.IP].src] += 1
-                dst_ips[packet[scapy.IP].dst] += 1
-                src_ports[f"TCP:{packet[scapy.TCP].sport}"] += 1
-                dst_ports[f"TCP:{packet[scapy.TCP].dport}"] += 1
+            if hasattr(packet, 'ip'):
+                src_ips[packet.ip.src] += 1
+                dst_ips[packet.ip.dst] += 1
+                src_ports[f"TCP:{packet.tcp.srcport}"] += 1
+                dst_ports[f"TCP:{packet.tcp.dstport}"] += 1
         
-        elif packet.haslayer(scapy.UDP):
+        elif hasattr(packet, 'udp'):
             packet_counts['udp'] += 1
             protocols['UDP'] += 1
-            if packet.haslayer(scapy.IP):
-                src_ips[packet[scapy.IP].src] += 1
-                dst_ips[packet[scapy.IP].dst] += 1
-                src_ports[f"UDP:{packet[scapy.UDP].sport}"] += 1
-                dst_ports[f"UDP:{packet[scapy.UDP].dport}"] += 1
+            if hasattr(packet, 'ip'):
+                src_ips[packet.ip.src] += 1
+                dst_ips[packet.ip.dst] += 1
+                src_ports[f"UDP:{packet.udp.srcport}"] += 1
+                dst_ports[f"UDP:{packet.udp.dstport}"] += 1
         
-        elif packet.haslayer(scapy.ICMP):
+        elif hasattr(packet, 'icmp'):
             packet_counts['icmp'] += 1
             protocols['ICMP'] += 1
         
         # Check for DNS packets
-        if packet.haslayer(scapy.DNS):
+        if hasattr(packet, 'dns'):
             packet_counts['dns'] += 1
             protocols['DNS'] += 1
         
         # Check for HTTP packets
-        if packet.haslayer(http.HTTPRequest):
+        if hasattr(packet, 'http'):
             packet_counts['http'] += 1
             protocols['HTTP'] += 1
     
-    # Print basic packet info
+    # Print the packet summary
     print_packet_summary(packet)
-
-def print_packet_summary(packet):
-    """Print a summary of the packet"""
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    summary = f"[{timestamp}] "
-    
-    if packet.haslayer(scapy.IP):
-        summary += f"{packet[scapy.IP].src} → {packet[scapy.IP].dst} "
-        
-        if packet.haslayer(scapy.TCP):
-            summary += f"TCP {packet[scapy.TCP].sport} → {packet[scapy.TCP].dport}"
-            # Check for HTTP
-            if packet.haslayer(http.HTTPRequest):
-                url = packet[http.HTTPRequest].Host.decode() + packet[http.HTTPRequest].Path.decode()
-                summary += f" HTTP: {url}"
-                
-        elif packet.haslayer(scapy.UDP):
-            summary += f"UDP {packet[scapy.UDP].sport} → {packet[scapy.UDP].dport}"
-            # Check for DNS
-            if packet.haslayer(scapy.DNS) and packet.haslayer(scapy.DNSQR):
-                try:
-                    qname = packet[scapy.DNSQR].qname.decode()
-                    summary += f" DNS: {qname}"
-                except:
-                    pass
-                
-        elif packet.haslayer(scapy.ICMP):
-            summary += f"ICMP type={packet[scapy.ICMP].type}"
-    else:
-        # Non-IP packet (e.g., ARP)
-        summary += packet.summary()
-    
-    print(summary)
 
 def print_statistics():
     """Print packet capture statistics"""
@@ -154,58 +280,156 @@ def print_statistics():
     for proto, count in top_protocols:
         print(f"  {proto}: {count} packets")
 
-def stop_sniffing_thread(duration, sniffer_thread):
-    """Thread to stop sniffing after duration"""
-    time.sleep(duration)
-    # This will only work correctly on Windows
-    if sniffer_thread.is_alive():
-        # Send a keyboard interrupt to the main thread
-        print("\nCapture duration reached. Stopping...")
-        # This uses Windows-specific approach to interrupt the sniffer
-        # Not ideal but works for this application
-        import os
-        os.kill(os.getpid(), 9)
-
-def sniff_packets(interface, duration=10, packet_count=None, filter_str=None):
-    """Sniff packets on the specified interface"""
+def capture_live_packets(interface, duration=30, bpf_filter=None):
+    """Capture live packets using pyshark"""
+    global stop_capture, TSHARK_PATH
+    stop_capture.clear()
+    
     print(f"\nStarting packet capture on {interface}")
     print(f"Duration: {duration} seconds")
-    if filter_str:
-        print(f"Filter: {filter_str}")
+    if bpf_filter:
+        print(f"Filter: {bpf_filter}")
     
     print("\nCapturing packets... Press Ctrl+C to stop")
     
-    # Create a thread to stop sniffing after duration
-    sniffer_thread = threading.current_thread()
-    stop_thread = threading.Thread(target=stop_sniffing_thread, 
-                                 args=(duration, sniffer_thread))
-    stop_thread.daemon = True
-    stop_thread.start()
+    # Reset packet counters
+    global packet_counts, src_ips, dst_ips, src_ports, dst_ports, protocols
+    packet_counts = {
+        'total': 0, 'tcp': 0, 'udp': 0, 'icmp': 0, 'dns': 0, 'http': 0, 'other': 0
+    }
+    src_ips.clear()
+    dst_ips.clear()
+    src_ports.clear()
+    dst_ports.clear()
+    protocols.clear()
     
+    # Start a timer to stop capture after duration
+    def stop_timer():
+        time.sleep(duration)
+        print("\nCapture duration reached. Stopping...")
+        stop_capture.set()
+    
+    timer_thread = threading.Thread(target=stop_timer)
+    timer_thread.daemon = True
+    timer_thread.start()
+    
+    # Start capturing
     try:
-        # Start the sniffer
-        scapy.sniff(iface=interface, 
-                   count=packet_count,
-                   prn=packet_callback,
-                   filter=filter_str,
-                   store=0)  # Don't store packets in memory (we do it manually)
+        # Configure capture options
+        capture_options = {
+            'interface': interface,
+            'display_filter': bpf_filter
+        }
+        
+        # If we found tshark path and it's not the default, set it
+        if TSHARK_PATH and TSHARK_PATH != "tshark":
+            # For pyshark to use our tshark path, we modify the environment PATH
+            os.environ['PATH'] = os.path.dirname(TSHARK_PATH) + os.pathsep + os.environ.get('PATH', '')
+            
+            # Some pyshark versions allow setting tshark path directly
+            try:
+                capture_options['tshark_path'] = TSHARK_PATH
+            except:
+                pass
+        
+        # Create capture
+        capture = pyshark.LiveCapture(**capture_options)
+        
+        # Set the sniff timeout to 1 second so we can check the stop flag
+        capture.sniff_timeout = 1
+        
+        # Start sniffing in a loop, checking the stop flag
+        start_time = time.time()
+        while not stop_capture.is_set() and time.time() - start_time < duration:
+            try:
+                # Capture packets for a short duration
+                for packet in capture.sniff_continuously(packet_count=10):
+                    if stop_capture.is_set():
+                        break
+                    process_packet(packet)
+            except Exception as e:
+                print(f"Error during capture: {e}")
+                time.sleep(0.1)  # Prevent tight loop if errors occur
+    
     except KeyboardInterrupt:
-        print("\nStopping packet capture...")
+        print("\nCapture stopped by user")
     except Exception as e:
         print(f"\nError during capture: {e}")
     finally:
+        stop_capture.set()
         print_statistics()
-        return captured_packets
+
+def check_wireshark_installation():
+    """Check if Wireshark/tshark is installed and accessible"""
+    global TSHARK_PATH
+    
+    # Try to find tshark path
+    if find_tshark_path():
+        # Run tshark to get version
+        try:
+            if TSHARK_PATH == "tshark":
+                cmd = ["tshark", "--version"]
+            else:
+                cmd = [TSHARK_PATH, "--version"]
+                
+            result = subprocess.run(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if result.returncode == 0:
+                version_info = result.stdout.split('\n')[0]
+                print(f"Wireshark/tshark found: {version_info}")
+                print(f"Using tshark at: {TSHARK_PATH}")
+                return True
+            else:
+                print(f"Wireshark/tshark found at {TSHARK_PATH} but returned an error")
+                return False
+        except Exception as e:
+            print(f"Error running tshark: {e}")
+            return False
+    else:
+        print("Wireshark/tshark not found on this system")
+        return False
+
+def check_admin():
+    """Check if the script is running with admin/root privileges"""
+    try:
+        is_admin = False
+        if os.name == 'nt':  # Windows
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        else:  # Unix/Linux/Mac
+            is_admin = os.geteuid() == 0
+        return is_admin
+    except:
+        return False
 
 def start_network_sniffer():
-    """Start the network sniffer module"""
-    print("\n--- Starting Network Sniffer (Scapy version) ---")
+    """Start the network sniffer module using pyshark"""
+    print("\n--- Starting Network Sniffer (Wireshark/pyshark version) ---")
+    
+    # Check admin privileges
+    if not check_admin():
+        print("\nWARNING: This script may not work correctly without administrator/root privileges.")
+        print("For best results, please run this program with elevated privileges.")
+        print("On Windows: Right-click and select 'Run as administrator'")
+        print("On Linux/Mac: Use 'sudo python main.py'\n")
+    
+    # Check if Wireshark is installed
+    if not check_wireshark_installation():
+        print("\nUnable to find Wireshark/tshark which is required for this module.")
+        print("Please install Wireshark from: https://www.wireshark.org/download.html")
+        input("\nPress Enter to return to main menu...")
+        return
     
     # Get available interfaces
     interfaces = get_interfaces()
     
     if not interfaces:
         print("No network interfaces found!")
+        input("\nPress Enter to return to main menu...")
         return
     
     # Get local IP to help identify the right interface
@@ -242,8 +466,10 @@ def start_network_sniffer():
         duration = 30
         print("Invalid input. Using default duration of 30 seconds.")
     
-    # Get optional BPF filter
+    # Get optional display filter
     filter_str = input("Enter capture filter (e.g., 'tcp port 80' or 'host 192.168.1.1') or leave empty: ")
+    if not filter_str.strip():
+        filter_str = None
     
     # Start packet capture
     try:
@@ -251,8 +477,8 @@ def start_network_sniffer():
         print("You may need to generate some network traffic to see results.")
         print("Press Ctrl+C to stop capture early.")
         
-        # Start sniffing
-        sniff_packets(interface, duration, filter_str=filter_str)
+        # Start capturing
+        capture_live_packets(interface, duration, filter_str)
         
     except Exception as e:
         print(f"Error: {e}")

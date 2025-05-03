@@ -55,10 +55,10 @@ def find_tshark_path():
     if os.name == 'nt':  # Windows
         # Common installation paths
         common_paths = [
-            r"C:\Program Files\Wireshark\tshark.exe",
-            r"C:\Program Files (x86)\Wireshark\tshark.exe",
-            r"C:\Wireshark\tshark.exe",
-            r"D:\Wireshark\tshark.exe",
+            "C:\\Program Files\\Wireshark\\tshark.exe",
+            "C:\\Program Files (x86)\Wireshark\\tshark.exe",
+            "C:\\Wireshark\\tshark.exe",
+            "D:\\Wireshark\\tshark.exe",
         ]
         
         # Search registry for Wireshark installation path
